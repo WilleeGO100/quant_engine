@@ -35,7 +35,7 @@ USE_DUMMY_STRATEGY = False  # <-- set to False later to go back to BTCPO3PowerSt
 # ==========================================
 # RISK / BACKTEST PARAMETERS
 # ==========================================
-STOP_ATR_MULT = 1.5      # how many ATR below/above entry for stop
+STOP_ATR_MULT = 1.2      # how many ATR below/above entry for stop
 TP_ATR_MULT = 3.0        # how many ATR above/below entry for take profit
 MAX_HOLD_BARS = 96       # max bars in trade (~8 hours on 5m)
 UNIT_SIZE = 1.0          # 1-unit per trade for now
