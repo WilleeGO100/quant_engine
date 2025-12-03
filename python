@@ -1,0 +1,22 @@
+====================================================
+[BACKTEST] BTC PO3 backtest starting...
+====================================================
+[BACKTEST] Loaded 1504 BTC 5m feature rows.
+[BACKTEST] Strategy: BTCPO3PowerStrategy instantiated.
+====================================================
+==== BTC PO3 BACKTEST (1-unit per trade) ==========
+====================================================
+Bars tested     : 1504
+Trades taken    : 0
+Win rate        : 0.0%
+Total PnL       : 0.00 (price units, 1-unit per trade)
+Avg win         : 0.00
+Avg loss        : 0.00
+Profit factor   : nan
+Max drawdown    : 0.00
+
+Stop ATR mult   : 1.5
+TP ATR mult     : 3.0
+Max hold (bars) : 96
+[BACKTEST] Trade log saved to btc_po3_trades.csv
+====================================================

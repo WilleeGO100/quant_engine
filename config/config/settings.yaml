@@ -1,0 +1,37 @@
+# config/settings.yaml
+
+# ============================
+# Risk / account settings
+# ============================
+account_size: 25000          # total account size in dollars
+max_daily_loss_pct: 2.0      # max % loss allowed per day
+max_risk_per_trade_pct: 0.5  # max % risk per individual trade
+
+# ============================
+# Instrument / position sizing
+# ============================
+symbol: "ES"                  # logical symbol we trade (ES, MNQ, etc.)
+default_position_size: 1.0    # number of contracts per signal
+contract_multiplier: 50.0     # ES = 50, MNQ = 2, etc.
+
+# ============================
+# Strategy selection
+# ============================
+strategy_name: "smc_po3_power"  # which strategy to use live
+
+# Path to multiframe ES features CSV used by main_live
+features_csv: "data/features/es_5m_multiframe_features.csv"
+
+# ============================
+# Live trading / TradersPost
+# ============================
+live_trading: false            # master kill switch for real/live trading
+test_traderspost: true         # keep true while we're experimenting
+traderspost_webhook_url: "https://webhooks.traderspost.io/trading/webhook/6d521a51-75c0-49fc-acda-427f9af5e6e2/ef543ebe65285b354d3844419465db9a"
+
+# ============================
+# LLM / AI approval layer
+# ============================
+llm_enabled: false             # we'll flip this to true when we wire it in
+llm_model:
+llm_max_tokens: 512
