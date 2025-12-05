@@ -17,18 +17,19 @@
 #       - vwap              (running VWAP)
 #       - vwap_dist_atr     ((close - vwap) / atr)
 #       - regime_trend_up   (True if fast EMA > slow EMA)
-#       - has_sweep         (placeholder, False for now)
-#
-# Main entry:
-#   build_btc_multiframe_features(prices: pd.DataFrame) -> pd.DataFrame
+#       - has_sweep         (liquidity sweep flag)
+#       - sweep_bull        (bullish sweep)
+#       - sweep_bear        (bearish sweep)
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import os
 
 import numpy as np
 import pandas as pd
+
+from engine.modules.sweeps import compute_sweep_flags
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -107,8 +108,6 @@ def _classify_session(index: pd.DatetimeIndex) -> pd.Series:
       - ASIA  : 00:00–07:59
       - LONDON: 08:00–15:59
       - NY    : 16:00–23:59
-
-    You can refine these later if you want exact FX session overlaps.
     """
     hours = index.hour
     session = pd.Series(index=index, dtype="object")
@@ -117,7 +116,6 @@ def _classify_session(index: pd.DatetimeIndex) -> pd.Series:
     session[(hours >= 8) & (hours < 16)] = "LONDON"
     session[(hours >= 16) & (hours < 24)] = "NY"
 
-    # Fallback for any NaNs
     session = session.fillna("NY")
     return session
 
@@ -207,6 +205,7 @@ def build_btc_multiframe_features(prices: pd.DataFrame) -> pd.DataFrame:
 
     # --- Core features ---
     df["atr"] = _compute_atr(df, period=14)
+    df["atr_5m"] = df["atr"]
     df["atr_pct_5m"] = df["atr"] / df["close"]
 
     df["rvol_5m"] = _compute_rvol(df["volume"], window=20)
@@ -218,13 +217,78 @@ def build_btc_multiframe_features(prices: pd.DataFrame) -> pd.DataFrame:
 
     df["regime_trend_up"] = _compute_regime_trend_up(df["close"], fast=20, slow=50)
 
-    # Placeholder for future sweep logic
-    df["has_sweep"] = False
-
-    # You can add more HTF features here later (1h/4h/1d aggregations, etc.)
+    # --- Liquidity sweep features ---
+    sweep_df = compute_sweep_flags(df, lookback=5)
+    df["sweep_bull"] = sweep_df["sweep_bull"]
+    df["sweep_bear"] = sweep_df["sweep_bear"]
+    df["has_sweep"] = sweep_df["has_sweep"]
 
     # Final forward-fill in case of early NaNs from rolling windows
     df = df.ffill()
 
     logger.info("BTC feature frame built. Final rows: %s", len(df))
     return df
+
+
+# ------------------------------------------------------------
+# Backwards-compatible alias for older code (no-arg version)
+# ------------------------------------------------------------
+def build_btc_5m_multiframe_features_institutional(
+    prices: pd.DataFrame | None = None,
+):
+    """
+    Backwards-compatible alias so older code that calls
+        build_btc_5m_multiframe_features_institutional()
+    with NO arguments still works.
+
+    Behavior:
+    - If `prices` is provided: use it directly, return (features_df, n_rows).
+    - If `prices` is None: try to load raw BTC OHLC from a few common paths
+      under the project `data/` folder, then build features.
+
+    Returns
+    -------
+    (features_df, n_rows)
+    """
+    if prices is None:
+        # Try several likely BTC 5m CSV names under ./data
+        candidate_paths = [
+            "data/btc_5m.csv",
+            "data/btc_5m_raw.csv",
+            "data/btc_usdt_5m.csv",
+            "data/btc_5m_prices.csv",
+        ]
+
+        found_path = None
+        for path in candidate_paths:
+            if os.path.exists(path):
+                found_path = path
+                break
+
+        if found_path is None:
+            raise RuntimeError(
+                "Could not find any BTC 5m CSV file. "
+                "Looked for: "
+                + ", ".join(candidate_paths)
+                + ". Please either place your raw BTC OHLC CSV in one of "
+                  "these locations, or pass a DataFrame directly to "
+                  "build_btc_multiframe_features(prices)."
+            )
+
+        try:
+            raw = pd.read_csv(
+                found_path,
+                parse_dates=True,
+                index_col=0,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not load raw BTC data from {found_path}. "
+                f"Make sure the CSV has a datetime-like index column."
+            ) from exc
+
+        prices = raw
+
+    features_df = build_btc_multiframe_features(prices)
+    n_rows = len(features_df)
+    return features_df, n_rows
