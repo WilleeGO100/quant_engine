@@ -222,8 +222,9 @@ def build_btc_multiframe_features(prices: pd.DataFrame) -> pd.DataFrame:
     df["sweep_bull"] = sweep_df["sweep_bull"]
     df["sweep_bear"] = sweep_df["sweep_bear"]
     df["has_sweep"] = sweep_df["has_sweep"]
-
+    df["sweep_strength"] = sweep_df["sweep_strength"]
     # --- FVG features (placeholder for now) ---
+
     fvg_df = compute_fvg_features(df)
     df["bull_fvg_origin"] = fvg_df["bull_fvg_origin"]
     df["bear_fvg_origin"] = fvg_df["bear_fvg_origin"]
