@@ -20,7 +20,6 @@
 #       - has_sweep         (liquidity sweep flag)
 #       - sweep_bull        (bullish sweep)
 #       - sweep_bear        (bearish sweep)
-
 from __future__ import annotations
 
 import logging
@@ -30,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 from engine.modules.sweeps import compute_sweep_flags
+from engine.modules.fvg import compute_fvg_features
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -222,6 +222,13 @@ def build_btc_multiframe_features(prices: pd.DataFrame) -> pd.DataFrame:
     df["sweep_bull"] = sweep_df["sweep_bull"]
     df["sweep_bear"] = sweep_df["sweep_bear"]
     df["has_sweep"] = sweep_df["has_sweep"]
+
+    # --- FVG features (placeholder for now) ---
+    fvg_df = compute_fvg_features(df)
+    df["bull_fvg_origin"] = fvg_df["bull_fvg_origin"]
+    df["bear_fvg_origin"] = fvg_df["bear_fvg_origin"]
+    df["in_bull_fvg"] = fvg_df["in_bull_fvg"]
+    df["in_bear_fvg"] = fvg_df["in_bear_fvg"]
 
     # Final forward-fill in case of early NaNs from rolling windows
     df = df.ffill()
