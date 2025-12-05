@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -28,18 +28,14 @@ from engine.strategies.smc_po3_power_btc import (
 )
 
 # ==========================================
-# TOGGLE: USE DUMMY STRATEGY OR REAL PO3
-# ==========================================
-USE_DUMMY_STRATEGY = False  # <-- set to False later to go back to BTCPO3PowerStrategy
-
-# ==========================================
 # RISK / BACKTEST PARAMETERS
 # ==========================================
-STOP_ATR_MULT = 1.2      # how many ATR below/above entry for stop
-TP_ATR_MULT = 2.5        # how many ATR above/below entry for take profit
-MAX_HOLD_BARS = 96       # max bars in trade (~8 hours on 5m)
-UNIT_SIZE = 1.0          # 1-unit per trade for now
-ATR_PERIOD = 14          # ATR lookback used for SL/TP
+STOP_ATR_MULT = 1.2       # tuned: tighter stop
+TP_ATR_MULT = 2.5         # tuned: slightly closer TP
+MAX_HOLD_BARS = 96        # max bars in trade (~8 hours on 5m)
+UNIT_SIZE = 1.0           # 1-unit per trade for now
+ATR_PERIOD = 14           # just for display (used in features)
+
 
 # ==========================================
 # DATA STRUCTURES
@@ -55,61 +51,6 @@ class Trade:
     pnl_pct: float
     bars_held: int
     exit_reason: str
-
-
-# ==========================================
-# DUMMY STRATEGY (for pipeline sanity check)
-# ==========================================
-class DummyTrendStrategy:
-    """
-    Extremely simple trend strategy:
-    - LONG when fast_ema > slow_ema
-    - SHORT when fast_ema < slow_ema
-    - HOLD otherwise
-    """
-
-    def __init__(self, df: pd.DataFrame, fast_len: int = 20, slow_len: int = 50):
-        self.fast = df["close"].ewm(span=fast_len, adjust=False).mean()
-        self.slow = df["close"].ewm(span=slow_len, adjust=False).mean()
-
-    def on_bar(self, row_dict: Dict[str, Any]) -> str:
-        idx = row_dict["index"]  # we will inject this before looping
-        f = float(self.fast.loc[idx])
-        s = float(self.slow.loc[idx])
-
-        if not np.isfinite(f) or not np.isfinite(s):
-            return "HOLD"
-
-        if f > s:
-            return "LONG"
-        elif f < s:
-            return "SHORT"
-        else:
-            return "HOLD"
-
-
-# ==========================================
-# HELPER: COMPUTE ATR FOR BACKTEST
-# ==========================================
-def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Compute classic ATR from high/low/close.
-    This is ONLY for SL/TP in the backtest, and does not change strategy logic.
-    """
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    close = df["close"].astype(float)
-
-    prev_close = close.shift(1)
-
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(period, min_periods=period).mean()
-
-    return atr
 
 
 # ==========================================
@@ -135,6 +76,34 @@ def compute_max_drawdown(trades: List[Trade]) -> float:
     return max_dd
 
 
+def compute_streaks(trades: List[Trade]) -> Dict[str, int]:
+    """
+    Compute longest win streak and loss streak based on trade PnL.
+    """
+    best_win_streak = 0
+    best_loss_streak = 0
+    cur_win_streak = 0
+    cur_loss_streak = 0
+
+    for t in trades:
+        if t.pnl > 0:
+            cur_win_streak += 1
+            best_win_streak = max(best_win_streak, cur_win_streak)
+            cur_loss_streak = 0
+        elif t.pnl < 0:
+            cur_loss_streak += 1
+            best_loss_streak = max(best_loss_streak, cur_loss_streak)
+            cur_win_streak = 0
+        else:
+            # flat pnl does not extend streaks, but also does not break them
+            pass
+
+    return {
+        "best_win_streak": best_win_streak,
+        "best_loss_streak": best_loss_streak,
+    }
+
+
 # ==========================================
 # CORE BACKTEST LOOP
 # ==========================================
@@ -147,77 +116,68 @@ def run_backtest() -> None:
     df, n_rows = build_btc_5m_multiframe_features_institutional()
     print(f"[BACKTEST] Loaded {n_rows} BTC 5m feature rows.")
 
-    # keep the index in a column so DummyTrendStrategy can reference it
-    df = df.copy()
-    df["index"] = df.index
+    # 2) Instantiate strategy with tuned config
+    config = BTCPO3PowerConfig(
+        # Volatility band (ATR%)
+        min_atr_pct=0.0008,      # ~0.08%
+        max_atr_pct=0.06,        # 6%
 
-    # 1B) Compute internal ATR for SL/TP (separate from feature ATR)
-    df["atr_bt"] = compute_atr(df, period=ATR_PERIOD)
+        # Relative volume filter
+        min_rvol=1.0,            # only normal+ volume
 
-    # 2) Instantiate strategy
-    if USE_DUMMY_STRATEGY:
-        strategy = DummyTrendStrategy(df)
-        print("[BACKTEST] Using DummyTrendStrategy (EMA trend) for pipeline check.")
-    else:
-        config = BTCPO3PowerConfig(
-            # ATR% filter: ignore ultra-dead + insane-wick zones
-            # (ATR% = atr_5m / close, roughly)
-            min_atr_pct=0.0008,      # 0.10% – avoid totally dead chop
-            max_atr_pct=0.06,       # 5% – avoid insane liquidation spikes
+        # Session filters (BTC: keep Asia too)
+        allow_asia=True,
+        allow_london=True,
+        allow_ny=True,
 
-            # RVOL filter: require at least "normal-ish" volume
-            min_rvol=1.0,           # was 0.0 → now only trade when volume is decent
+        # Trend regime currently off (PO3 structure already encoded)
+        use_trend_regime=False,
 
-            # Session filters: BTC trades 24/7 but "real" flow is usually London+NY
-            allow_asia=True,        # keep Asia for now (we can turn off later)
-            allow_london=True,
-            allow_ny=True,
+        # Weekly position: only trade away from absolute extremes
+        min_week_pos_for_longs=0.20,
+        max_week_pos_for_shorts=0.80,
 
-            # Trend regime: keep OFF until we confirm the feature is clean
-            use_trend_regime=True,
+        # VWAP distance: within 2 ATRs of VWAP
+        max_vwap_dist_atr_entry=2.0,
 
-            # Weekly position: bias longs away from absolute highs, shorts away from lows
-            min_week_pos_for_longs=0.20,   # only long above 10% of weekly range
-            max_week_pos_for_shorts=0.80,  # only short below 90% of weekly range
+        # Sweep logic currently optional
+        require_sweep=False,
+        lookback_sweep_bars=5,
 
-            # VWAP distance: force trades reasonably near "value"
-            max_vwap_dist_atr_entry=2.0,   # within 2 ATRs of VWAP
-
-            # Sweep requirement: still off for now
-            require_sweep=False,
-            lookback_sweep_bars=5,
-
-            verbose=False,
-        )
-
-        strategy = BTCPO3PowerStrategy(config=config)
-        print("[BACKTEST] Using BTCPO3PowerStrategy with fully open filters.")
+        verbose=False,
+    )
+    strategy = BTCPO3PowerStrategy(config=config)
+    print("[BACKTEST] Strategy: BTCPO3PowerStrategy instantiated.")
 
     # 3) Iterate over bars, simulate trades
     trades: List[Trade] = []
 
-    current_side: str | None = None  # "LONG" or "SHORT"
+    current_side: Optional[str] = None  # "LONG" or "SHORT"
     entry_price: float = 0.0
-    entry_time: pd.Timestamp | None = None
+    entry_time: Optional[pd.Timestamp] = None
     bars_in_trade: int = 0
 
     stop_price: float = 0.0
     tp_price: float = 0.0
 
-    # Debug counters
     bars_with_atr = 0
     long_signals = 0
     short_signals = 0
     hold_signals = 0
 
-    # We iterate over rows in time order
+    last_ts: Optional[pd.Timestamp] = None
+    last_close: Optional[float] = None
+
     for ts, row in df.iterrows():
+        last_ts = ts
+        last_close = float(row["close"])
+
         row_dict: Dict[str, Any] = row.to_dict()
 
         close = float(row["close"])
         high = float(row["high"])
         low = float(row["low"])
-        atr = float(row.get("atr_bt", np.nan))
+        atr = float(row.get("atr_5m", np.nan))
 
         # Skip if ATR not ready yet
         if not np.isfinite(atr) or atr <= 0:
@@ -225,7 +185,6 @@ def run_backtest() -> None:
 
         bars_with_atr += 1
 
-        # Strategy signal is based on the full feature row
         signal = strategy.on_bar(row_dict)  # "LONG", "SHORT", "HOLD"
 
         if signal == "LONG":
@@ -319,23 +278,23 @@ def run_backtest() -> None:
                 stop_price = 0.0
                 tp_price = 0.0
 
-    # 3B) If a trade is still open at the very end, close it at last close
-    if current_side is not None and entry_time is not None:
-        last_close = float(df.iloc[-1]["close"])
-        ts = df.index[-1]
+                # If exit_reason == "FLIP" and we got a new signal, we could
+                # immediately open the opposite side here. For now, we wait
+                # for next bar to avoid over-complication.
 
+    # If we still have an open position at the very end, close it at last close
+    if current_side is not None and last_ts is not None and last_close is not None and entry_time is not None:
         if current_side == "LONG":
             pnl = (last_close - entry_price) * UNIT_SIZE
         else:
             pnl = (entry_price - last_close) * UNIT_SIZE
-
         pnl_pct = pnl / entry_price if entry_price != 0 else 0.0
 
         trades.append(
             Trade(
                 side=current_side,
                 entry_time=entry_time,
-                exit_time=ts,
+                exit_time=last_ts,
                 entry_price=entry_price,
                 exit_price=last_close,
                 pnl=pnl,
@@ -369,6 +328,7 @@ def run_backtest() -> None:
         profit_factor = np.nan
 
     max_dd = compute_max_drawdown(trades)
+    streaks = compute_streaks(trades)
 
     print(f"Bars tested     : {bars_tested}")
     print(f"Bars w/ ATR     : {bars_with_atr}")
@@ -388,23 +348,63 @@ def run_backtest() -> None:
     print(f"LONG signals    : {long_signals}")
     print(f"SHORT signals   : {short_signals}")
     print(f"HOLD signals    : {hold_signals}")
+    print()
+    print(f"Best win streak : {streaks['best_win_streak']}")
+    print(f"Worst loss streak: {streaks['best_loss_streak']}")
 
-    # 5) Save trades to CSV
-    trades_df = pd.DataFrame(
-        {
-            "side": [t.side for t in trades],
-            "entry_time": [t.entry_time for t in trades],
-            "exit_time": [t.exit_time for t in trades],
-            "entry_price": [t.entry_price for t in trades],
-            "exit_price": [t.exit_price for t in trades],
-            "pnl": [t.pnl for t in trades],
-            "pnl_pct": [t.pnl_pct for t in trades],
-            "bars_held": [t.bars_held for t in trades],
-            "exit_reason": [t.exit_reason for t in trades],
-        }
-    )
-    trades_df.to_csv("btc_po3_trades.csv", index=False)
-    print("[BACKTEST] Trade log saved to btc_po3_trades.csv")
+    # 5) Exit reason breakdown
+    if trades:
+        exit_reasons = {}
+        for t in trades:
+            exit_reasons[t.exit_reason] = exit_reasons.get(t.exit_reason, 0) + 1
+
+        print()
+        print("Exit reason counts:")
+        for reason, count in sorted(exit_reasons.items()):
+            print(f"  {reason:5s}: {count}")
+
+    # 6) Daily PnL summary
+    if trades:
+        trades_df = pd.DataFrame(
+            {
+                "side": [t.side for t in trades],
+                "entry_time": [t.entry_time for t in trades],
+                "exit_time": [t.exit_time for t in trades],
+                "entry_price": [t.entry_price for t in trades],
+                "exit_price": [t.exit_price for t in trades],
+                "pnl": [t.pnl for t in trades],
+                "pnl_pct": [t.pnl_pct for t in trades],
+                "bars_held": [t.bars_held for t in trades],
+                "exit_reason": [t.exit_reason for t in trades],
+            }
+        )
+
+        trades_df["exit_date"] = trades_df["exit_time"].dt.date
+        daily_pnl = trades_df.groupby("exit_date")["pnl"].sum().sort_index()
+
+        best_day = daily_pnl.max()
+        worst_day = daily_pnl.min()
+        best_day_date = daily_pnl.idxmax()
+        worst_day_date = daily_pnl.idxmin()
+
+        print()
+        print("Daily PnL:")
+        for d, v in daily_pnl.items():
+            print(f"  {d}: {v:.2f}")
+
+        print()
+        print(f"Best day        : {best_day_date} ({best_day:.2f})")
+        print(f"Worst day       : {worst_day_date} ({worst_day:.2f})")
+
+        # 7) Save trades to CSV
+        trades_df.drop(columns=["exit_date"], inplace=True)
+        trades_df.to_csv("btc_po3_trades.csv", index=False)
+        print()
+        print("[BACKTEST] Trade log saved to btc_po3_trades.csv")
+    else:
+        print()
+        print("[BACKTEST] No trades generated, not writing CSV.")
+
     print("====================================================")
 
 
