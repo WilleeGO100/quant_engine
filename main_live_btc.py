@@ -16,7 +16,10 @@ from config.config import load_config
 from engine.features.btc_multiframe_features import (
     build_btc_5m_multiframe_features_institutional,
 )
-from engine.strategies.smc_po3_power_btc import BTCPO3PowerStrategy
+from engine.strategies.smc_po3_power_btc import (
+    BTCPO3PowerStrategy,
+    BTCPO3PowerConfig,
+)
 from engine.agent.llm_approval import LLMApprovalAgent
 from engine.risk.risk_manager import RiskManager
 from engine.execution.traderspost_executor import TradersPostExecutor
@@ -64,27 +67,104 @@ def main() -> None:
     df, n_rows = build_btc_5m_multiframe_features_institutional()
     print(f"[BTC_LIVE] Feature DataFrame size: {n_rows} rows")
 
+    if n_rows == 0 or df is None:
+        print("[BTC_LIVE] No BTC feature rows returned -> aborting.")
+        print("====================================================")
+        return
+
     # Grab latest row
     last = df.iloc[-1]
     _print_btc_snapshot(last)
 
     # --------------------------------------------------
-    # 3) Run BTC PO3 POWER strategy on the latest bar
+    # 3) Prepare strategy + latest bar dict
     # --------------------------------------------------
     print("[BTC_LIVE] Running BTCPO3PowerStrategy.on_bar()...")
-    strategy = BTCPO3PowerStrategy()
 
-    # Strategy expects a dict-like bar
-    signal = strategy.on_bar(last.to_dict())
+    # Use the same config that worked in backtests/paper engine
+    strat_cfg = BTCPO3PowerConfig(
+        # ATR% filter: ignore ultra-dead + insane-wick zones
+        min_atr_pct=0.0008,
+        max_atr_pct=0.06,
+
+        # RVOL filter
+        min_rvol=1.0,
+
+        # Session filters
+        allow_asia=True,
+        allow_london=True,
+        allow_ny=True,
+
+        # Trend regime
+        use_trend_regime=True,
+
+        # Weekly location constraints
+        min_week_pos_for_longs=0.20,
+        max_week_pos_for_shorts=0.80,
+
+        # Distance from VWAP in ATR units
+        max_vwap_dist_atr_entry=2.0,
+
+        # Sweep requirement currently off
+        require_sweep=False,
+        lookback_sweep_bars=5,
+
+        # TURN ON VERBOSE so we see which filter fails on HOLD
+        verbose=True,
+    )
+    strategy = BTCPO3PowerStrategy(config=strat_cfg)
+
+    # Strategy expects a dict-like bar with some specific keys.
+    last_dict: Dict[str, Any] = last.to_dict()
+
+    # 1) ATR% of price: atr_pct_5m = atr_5m / close
+    close_price = float(last["close"])
+    atr_5m = float(last.get("atr_5m", 0.0))
+    if close_price != 0.0 and atr_5m > 0.0:
+        last_dict["atr_pct_5m"] = atr_5m / close_price
+    else:
+        # fallback; strategy will treat this as "average" vol
+        last_dict["atr_pct_5m"] = 0.01
+
+    # 2) Relative volume: rvol_5m (already produced by feature builder)
+    #    If missing, default to 1.0 (normal volume)
+    if "rvol_5m" not in last_dict:
+        last_dict["rvol_5m"] = 1.0
+
+    # 3) Session tag: strategy looks for "session_type"
+    #    Our feature frame uses "session"
+    if "session" in last.index:
+        last_dict["session_type"] = last["session"]
+    else:
+        last_dict["session_type"] = "NY"
+
+    # 4) Weekly position, VWAP distance, regime_trend_up should already exist
+    #    but we make sure there is at least a safe fallback:
+    last_dict.setdefault("week_pos", 0.5)          # mid-week
+    last_dict.setdefault("vwap_dist_atr", 0.0)     # on VWAP
+    last_dict.setdefault("regime_trend_up", True)  # trending up
+
+    # --------------------------------------------------
+    # 4) Strategy raw signal on latest bar
+    # --------------------------------------------------
+    signal = strategy.on_bar(last_dict)
     print(f"[BTC_LIVE] Strategy raw signal: {signal}")
 
     if signal not in ("LONG", "SHORT"):
+        # HOLD diagnostics: show exactly what the PO3 filters are seeing
         print("[BTC_LIVE] Strategy returned 'HOLD' -> no trade.")
+        print("[BTC_LIVE] HOLD diagnostics (key PO3 inputs):")
+        print(f"  atr_pct_5m     : {last_dict.get('atr_pct_5m')}")
+        print(f"  rvol_5m        : {last_dict.get('rvol_5m')}")
+        print(f"  week_pos       : {last_dict.get('week_pos')}")
+        print(f"  vwap_dist_atr  : {last_dict.get('vwap_dist_atr')}")
+        print(f"  session_type   : {last_dict.get('session_type')}")
+        print(f"  regime_trend_up: {last_dict.get('regime_trend_up')}")
         print("====================================================")
         return
 
     # --------------------------------------------------
-    # 4) Build raw_decision object
+    # 5) Build raw_decision object
     # --------------------------------------------------
     now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
     raw_decision: Dict[str, Any] = {
@@ -97,13 +177,17 @@ def main() -> None:
             "trade_symbol": getattr(cfg, "trade_symbol", "BTCUSD"),
             "feed_symbol": getattr(cfg, "feed_symbol", "BTCUSD"),
             "generated_at": now_utc,
+            "last_price": float(last["close"]),
+            "session": last_dict.get("session_type", "NY"),
+            "week_pos": float(last_dict.get("week_pos", 0.5)),
+            "vwap_dist_atr": float(last_dict.get("vwap_dist_atr", 0.0)),
         },
     }
 
     print(f"[BTC_LIVE] Raw decision: {raw_decision}")
 
     # --------------------------------------------------
-    # 5) LLM approval layer
+    # 6) LLM approval layer
     # --------------------------------------------------
     llm_mode = getattr(cfg, "llm_mode", "off")
     llm_api_key = getattr(cfg, "openai_api_key", "")
@@ -128,7 +212,7 @@ def main() -> None:
         return
 
     # --------------------------------------------------
-    # 6) RiskManager layer
+    # 7) RiskManager layer
     # --------------------------------------------------
     risk = RiskManager(config=cfg)
     current_state: Dict[str, Any] = {}  # extend later with PnL/position state
@@ -142,7 +226,7 @@ def main() -> None:
         return
 
     # --------------------------------------------------
-    # 7) TradersPostExecutor – send test order (DRY RUN while live_trading=False)
+    # 8) TradersPostExecutor – send test order (DRY RUN while live_trading=False)
     # --------------------------------------------------
     executor = TradersPostExecutor(config=cfg)
 

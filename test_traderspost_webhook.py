@@ -10,8 +10,8 @@ import requests
 
 WEBHOOK_URL = (
     "https://webhooks.traderspost.io/trading/webhook/"
-    "6d521a51-75c0-49fc-acda-427f9af5e6e2/ef543ebe65285b354d3844419465db9a"
-)
+"6d521a51-75c0-49fc-acda-427f9af5e6e2/ef543ebe65285b354d3844419465db9a")
+
 
 def main() -> None:
     payload = {
