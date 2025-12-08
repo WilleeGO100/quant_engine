@@ -1,104 +1,148 @@
 # engine/execution/traderspost_executor.py
+#
+# TradersPostExecutor
+# -------------------
+# Small wrapper that turns a signal into a TradersPost webhook payload
+# and (optionally) POSTs it to your webhook URL.
+#
+# Supports both:
+#   - dict config
+#   - Config dataclass from config/config.py
+#
+# Expected config fields (either as keys or attributes):
+#   - traderspost_webhook_url : str   (full webhook URL)
+#   - trade_symbol            : str   (e.g. "BTCUSD")
+#   - traderspost_ticker      : str   (fallback ticker name)
+#   - traderspost_account_id  : str   (optional; your TradersPost account ID)
+#   - entry_order_type        : str   ("market", "limit", etc.), default "market"
+#   - live_trading            : bool  (False = always dry run)
+#
+# Public method:
+#   send_order(signal: str, size: float, test: bool, meta: dict | None)
+#
+#   signal : "LONG" / "SHORT" / "BUY" / "SELL"
+#   size   : position size (e.g. 0.01 BTC, 1 contract, etc.)
+#   test   : if True, payload will include "test": true
+#   meta   : optional dict -> goes into payload["meta"]
+#
+
 from __future__ import annotations
 
 import json
-from typing import Optional, Dict, Any
-
-import requests
+from typing import Any, Dict, Optional
 
 
 class TradersPostExecutor:
-    """
-    Send LONG / SHORT signals to TradersPost.
-
-    Config keys expected:
-        - traderspost_webhook_url: str
-        - traderspost_ticker: str        (e.g. "BTCUSD")
-        - traderspost_account_id: str    (your TP paper account ID)
-        - entry_order_type: str          ("market" or "limit")
-        - live_trading: bool             (False = DRY RUN, True = actually hit webhook)
-    """
-
-    def __init__(self, config: Dict[str, Any]) -> None:
-        self.url: str = config.get("traderspost_webhook_url", "")
-        self.ticker: str = config.get("traderspost_ticker", "BTCUSD")
-        self.account_id: str = config.get("traderspost_account_id", "")
-        self.order_type: str = config.get("entry_order_type", "market")
-        self.live_trading: bool = bool(config.get("live_trading", False))
-
-        if not self.url:
-            raise ValueError("TradersPostExecutor: 'traderspost_webhook_url' is missing.")
-        if not self.account_id:
-            raise ValueError("TradersPostExecutor: 'traderspost_account_id' (paper account) is missing.")
-
-    def _map_signal_to_action(self, signal: str) -> str:
+    def __init__(self, config: Any) -> None:
         """
-        Convert our strategy signal into TradersPost 'action'.
+        config can be:
+          - a dict
+          - your Config dataclass instance
         """
-        s = signal.upper()
-        if s == "LONG":
-            return "buy"
-        if s == "SHORT":
-            return "sell"
-        raise ValueError(f"Unsupported signal for TradersPost: {signal}")
+        if isinstance(config, dict):
+            cfg = config
+            self.live_trading: bool = bool(cfg.get("live_trading", False))
+            self.webhook_url: str = cfg.get("traderspost_webhook_url", "")
+            # prefer trade_symbol, fallback to traderspost_ticker, then BTCUSD
+            self.ticker: str = cfg.get("trade_symbol") or cfg.get("traderspost_ticker", "BTCUSD")
+            self.account_id: Optional[str] = (cfg.get("traderspost_account_id") or "").strip() or None
+            self.order_type: str = cfg.get("entry_order_type", "market")
+        else:
+            # Assume Config dataclass with attributes
+            self.live_trading = bool(getattr(config, "live_trading", False))
+            self.webhook_url = getattr(config, "traderspost_webhook_url", "")
+            self.ticker = getattr(
+                config,
+                "trade_symbol",
+                getattr(config, "traderspost_ticker", "BTCUSD"),
+            )
+            self.account_id = (getattr(config, "traderspost_account_id", "") or "").strip() or None
+            self.order_type = getattr(config, "entry_order_type", "market")
 
+        if not self.webhook_url:
+            print(
+                "[TradersPostExecutor] WARNING: traderspost_webhook_url is empty. "
+                "All sends will be treated as DRY RUN."
+            )
+
+    # --------------------------------------------------
+    # Public API
+    # --------------------------------------------------
     def send_order(
         self,
         signal: str,
         size: float,
-        test: bool = True,
+        test: bool,
         meta: Optional[Dict[str, Any]] = None,
-    ):
+    ) -> None:
         """
-        Main public method.
+        Build and (optionally) POST a TradersPost webhook payload.
 
-        signal : "LONG" or "SHORT"
-        size   : numeric quantity (e.g. 0.01 BTC, 1 contract, etc.)
-        test   : if True, marks the order as test/simulated (TradersPost 'test' flag)
-
-        NOTE:
-        - If self.live_trading is False, we DO NOT send an HTTP request.
-        - If self.live_trading is True, we send the payload to TradersPost.
+        signal : "LONG" / "SHORT" / "BUY" / "SELL"
+        size   : numeric quantity
+        test   : if True, payload includes "test": true
+        meta   : optional dict -> payload["meta"]
         """
+        if signal is None:
+            print("[TradersPostExecutor] signal is None -> not sending.")
+            return
 
-        action = self._map_signal_to_action(signal)
+        action_map = {
+            "LONG": "buy",
+            "BUY": "buy",
+            "SHORT": "sell",
+            "SELL": "sell",
+        }
 
-        # 'test' flag is true if either:
-        #   - we are not in live_trading mode, OR
-        #   - the caller explicitly passes test=True
-        test_flag = (not self.live_trading) or bool(test)
+        sig_upper = str(signal).upper()
+        action = action_map.get(sig_upper)
+        if action is None:
+            print(f"[TradersPostExecutor] Unknown signal='{signal}' -> not sending.")
+            return
+
+        qty = float(size)
 
         payload: Dict[str, Any] = {
             "ticker": self.ticker,
             "action": action,
-            "quantity": size,
+            "quantity": qty,
             "orderType": self.order_type,
-            "accountId": self.account_id,   # <- your TradersPost PAPER account
-            "test": test_flag,
+            "test": bool(test),
         }
+
+        if self.account_id:
+            payload["accountId"] = self.account_id
 
         if meta:
             payload["meta"] = meta
 
-        print("\n[TradersPostExecutor] Prepared payload:")
+        print("[TradersPostExecutor] Prepared payload:")
         print(json.dumps(payload, indent=2))
 
-        # Safety: DRY RUN mode
-        if not self.live_trading:
-            print("[TradersPostExecutor] DRY RUN: live_trading=False -> not sending webhook.")
-            return payload
-
-        # Live HTTP POST (use with care!)
-        try:
-            resp = requests.post(
-                self.url,
-                headers={"Content-Type": "application/json"},
-                data=json.dumps(payload),
-                timeout=10,
+        # Decide whether to actually POST
+        if (not self.live_trading) or test or (not self.webhook_url):
+            print(
+                "[TradersPostExecutor] DRY RUN: "
+                f"live_trading={self.live_trading} test={test} "
+                f"url={'SET' if bool(self.webhook_url) else 'MISSING'} -> not sending webhook."
             )
-            print(f"[TradersPostExecutor] Webhook response: {resp.status_code}")
-            print(resp.text)
-            return resp
+            return
+
+        # Live POST
+        try:
+            import requests
+        except ImportError:
+            print(
+                "[TradersPostExecutor] ERROR: 'requests' is not installed. "
+                "Install it with 'pip install requests' to enable live webhooks."
+            )
+            return
+
+        try:
+            resp = requests.post(self.webhook_url, json=payload, timeout=5)
+            print(
+                f"[TradersPostExecutor] Webhook POST status={resp.status_code} "
+                f"body={resp.text[:200]!r}"
+            )
         except Exception as e:
             print(f"[TradersPostExecutor] ERROR sending webhook: {e}")
-            return None

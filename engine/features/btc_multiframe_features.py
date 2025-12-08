@@ -7,7 +7,6 @@
 #       timestamp, open, high, low, close, volume
 #
 # Output:
-<<<<<<< HEAD
 #   DataFrame indexed by timestamp with at least:
 #       open, high, low, close, volume
 #       open_1h, high_1h, low_1h, close_1h
@@ -27,30 +26,10 @@ from __future__ import annotations
 
 import os
 from typing import Tuple
-=======
-#   features: DataFrame with:
-#       - open, high, low, close, volume
-#       - atr               (14-period ATR)
-#       - atr_pct_5m        (atr / close)
-#       - rvol_5m           (volume / 20-bar rolling volume mean)
-#       - session_type      ("ASIA", "LONDON", "NY")
-#       - week_pos          (0–1, position within weekly low→high range)
-#       - vwap              (running VWAP)
-#       - vwap_dist_atr     ((close - vwap) / atr)
-#       - regime_trend_up   (True if fast EMA > slow EMA)
-#       - has_sweep         (liquidity sweep flag)
-#       - sweep_bull        (bullish sweep)
-#       - sweep_bear        (bearish sweep)
-from __future__ import annotations
-
-import logging
-import os
->>>>>>> origin/phase5-features
 
 import numpy as np
 import pandas as pd
 
-<<<<<<< HEAD
 # ------------------------------------------------------
 # Resolve project root and CSV path
 # ------------------------------------------------------
@@ -59,18 +38,6 @@ import pandas as pd
 # Project root is two levels up.
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 BTC_5M_CSV_PATH = os.path.join(BASE_DIR, "data", "5m_btc.csv")
-=======
-from engine.modules.sweeps import compute_sweep_flags
-from engine.modules.fvg import compute_fvg_features
-
-logger = logging.getLogger(__name__)
-if not logger.handlers:
-    h = logging.StreamHandler()
-    f = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
-    h.setFormatter(f)
-    logger.addHandler(h)
-    logger.setLevel(logging.INFO)
->>>>>>> origin/phase5-features
 
 
 # ------------------------------------------------------
@@ -152,16 +119,9 @@ def _resample_ohlc(
     suffix: str,
 ) -> pd.DataFrame:
     """
-<<<<<<< HEAD
     Resample 5m OHLC to higher timeframe and align back to 5m via merge_asof.
     rule: "1h", "4h", "1d" etc.
     suffix: "_1h", "_4h", "_1d"
-=======
-    Simple UTC-based session classification:
-      - ASIA  : 00:00–07:59
-      - LONDON: 08:00–15:59
-      - NY    : 16:00–23:59
->>>>>>> origin/phase5-features
     """
     ohlc = df[["open", "high", "low", "close"]].resample(rule).agg(
         {"open": "first", "high": "max", "low": "min", "close": "last"}
@@ -178,12 +138,7 @@ def _resample_ohlc(
         direction="backward",
     )
 
-<<<<<<< HEAD
     return merged
-=======
-    session = session.fillna("NY")
-    return session
->>>>>>> origin/phase5-features
 
 
 def _compute_week_range_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -206,7 +161,6 @@ def _compute_week_range_features(df: pd.DataFrame) -> pd.DataFrame:
     df["week_low"] = week_low
     df["week_pos"] = week_pos
 
-<<<<<<< HEAD
     return df
 
 
@@ -322,42 +276,111 @@ def _compute_vwap_dist(df: pd.DataFrame) -> pd.DataFrame:
 # ------------------------------------------------------
 
 
-def build_btc_5m_multiframe_features_institutional() -> Tuple[pd.DataFrame, int]:
+def build_btc_5m_multiframe_features_institutional_from_df(
+    prices: pd.DataFrame,
+) -> Tuple[pd.DataFrame, int]:
     """
-    Full institutional-style feature builder for BTC 5m.
+    Institutional BTC 5m feature builder that works directly from an
+    in-memory 5m OHLCV DataFrame instead of reading data/5m_btc.csv.
 
-    Returns:
-        df (pd.DataFrame): Indexed by timestamp with engineered features.
-        n_rows (int): Number of rows after feature construction.
+    This does NOT change the behaviour of the original
+    build_btc_5m_multiframe_features_institutional(); it simply mirrors
+    the same pipeline but starts from the provided DataFrame.
+
+    Expected input:
+        prices.index  : DatetimeIndex (tz-aware or naive, will be converted to UTC)
+        prices.columns: must contain at least open, high, low, close, volume
+                        (case-insensitive is fine – they will be normalised).
     """
-    # 1) Load base 5m data
-    df = _load_btc_5m_csv(BTC_5M_CSV_PATH)
+    # 0) Guard: empty input
+    if prices is None or prices.empty:
+        return pd.DataFrame(), 0
 
-    # 2) Compute ATR and RVOL on 5m
+    # 1) Start from a copy
+    df = prices.copy()
+
+    # 2) Normalise index to a clean UTC DatetimeIndex
+    if not isinstance(df.index, pd.DatetimeIndex):
+        # Try to use a 'timestamp' column if present
+        if "timestamp" not in df.columns:
+            raise ValueError(
+                "build_btc_5m_multiframe_features_institutional_from_df "
+                "expects a DatetimeIndex or a 'timestamp' column."
+            )
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        df = df.set_index("timestamp")
+    else:
+        # Ensure UTC, sorted, and drop invalid timestamps
+        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+        df = df[~df.index.isna()]
+        df = df.sort_index()
+
+    if df.empty:
+        return pd.DataFrame(), 0
+
+    # 3) Normalise column names to lowercase so we can reliably refer to
+    #    'open', 'high', 'low', 'close', 'volume'.
+    df.columns = [str(c).lower() for c in df.columns]
+
+    # 4) Ensure numeric OHLCV
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Drop rows with bad OHLC
+    df = df.dropna(subset=["open", "high", "low", "close"])
+
+    if df.empty:
+        return pd.DataFrame(), 0
+
+    # 5) Handle volume – we want non-NaN, positive values so rvol_5m
+    #    isn't all NaN and doesn't get nuked by the final dropna.
+    if "volume" not in df.columns:
+        df["volume"] = 1.0
+    else:
+        if df["volume"].isna().all():
+            # no usable volume at all -> synthesize flat volume
+            df["volume"] = 1.0
+        else:
+            median_vol = df["volume"].median()
+            if pd.isna(median_vol) or median_vol <= 0:
+                median_vol = 1.0
+            df["volume"] = df["volume"].fillna(median_vol)
+            if (df["volume"] <= 0).all():
+                df["volume"] = 1.0
+
+    if df.empty:
+        return pd.DataFrame(), 0
+
+    # 6) --- Mirror the original institutional pipeline ---
+
+    # 6.1) ATR and RVOL on 5m
     df["atr_5m"] = _compute_atr(df, period=14)
     df["rvol_5m"] = _compute_rvol(df, window=20)
 
-    # 3) Resample to 1H, 4H, 1D OHLC and align back
+    # 6.2) Resample to 1H, 4H, 1D OHLC and align back
     df = _resample_ohlc(df, rule="1h", suffix="_1h")
     df = _resample_ohlc(df, rule="4h", suffix="_4h")
     df = _resample_ohlc(df, rule="1d", suffix="_1d")
 
-    # 4) Week range features
+    # 6.3) Week range features
     df = _compute_week_range_features(df)
 
-    # 5) Trend & volatility regimes
+    # 6.4) Trend & volatility regimes
     df = _compute_trend_vol_regimes(df)
 
-    # 6) Session tags
+    # 6.5) Session tags
     df = _compute_sessions(df)
 
-    # 7) Previous-day sweep flags
+    # 6.6) Previous-day sweep flags
     df = _compute_prev_day_sweeps(df)
 
-    # 8) VWAP distance
+    # 6.7) VWAP distance
     df = _compute_vwap_dist(df)
 
-    # 9) Final cleanup: drop rows where we don't have core features yet
+    # 7) Final cleanup: same required core columns as CSV version
     required_cols = [
         "open",
         "high",
@@ -389,162 +412,4 @@ def build_btc_5m_multiframe_features_institutional() -> Tuple[pd.DataFrame, int]
 
     n_rows = len(df)
     return df, n_rows
-=======
-    return week_pos
 
-
-# ------------------------------------------------------------
-# VWAP + VWAP distance in ATR units
-# ------------------------------------------------------------
-def _compute_vwap(prices: pd.DataFrame) -> pd.Series:
-    close = prices["close"]
-    volume = prices["volume"]
-
-    # Avoid 0 volume degeneracy: treat 0-volume as 1 for vwap math
-    vol_safe = volume.replace(0, 1.0)
-
-    cum_pv = (close * vol_safe).cumsum()
-    cum_vol = vol_safe.cumsum()
-
-    vwap = cum_pv / cum_vol
-    return vwap
-
-
-def _compute_vwap_dist_atr(close: pd.Series, vwap: pd.Series, atr: pd.Series) -> pd.Series:
-    dist = (close - vwap)
-    dist_atr = dist / atr.replace(0, np.nan)
-    dist_atr = dist_atr.replace([np.inf, -np.inf], np.nan)
-    dist_atr = dist_atr.fillna(0.0)
-    return dist_atr
-
-
-# ------------------------------------------------------------
-# Regime: simple EMA-based "trend up"
-# ------------------------------------------------------------
-def _compute_regime_trend_up(close: pd.Series, fast: int = 20, slow: int = 50) -> pd.Series:
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    regime_up = ema_fast > ema_slow
-    return regime_up
-
-
-# ------------------------------------------------------------
-# MAIN ENTRY: build_btc_multiframe_features
-# ------------------------------------------------------------
-def build_btc_multiframe_features(prices: pd.DataFrame) -> pd.DataFrame:
-    """
-    Main feature builder for BTC 5m institutional frame.
-
-    Parameters
-    ----------
-    prices : pd.DataFrame
-        Columns: at least [open, high, low, close] and optionally [volume]
-        Index: DatetimeIndex (5m bars, ideally UTC)
-
-    Returns
-    -------
-    pd.DataFrame
-        Feature frame aligned with input index.
-    """
-    logger.info("Building BTC multiframe features from %s rows...", len(prices))
-
-    df = _normalize_prices(prices.copy())
-
-    # --- Core features ---
-    df["atr"] = _compute_atr(df, period=14)
-    df["atr_5m"] = df["atr"]
-    df["atr_pct_5m"] = df["atr"] / df["close"]
-
-    df["rvol_5m"] = _compute_rvol(df["volume"], window=20)
-    df["session_type"] = _classify_session(df.index)
-    df["week_pos"] = _compute_week_position(df)
-
-    df["vwap"] = _compute_vwap(df)
-    df["vwap_dist_atr"] = _compute_vwap_dist_atr(df["close"], df["vwap"], df["atr"])
-
-    df["regime_trend_up"] = _compute_regime_trend_up(df["close"], fast=20, slow=50)
-
-    # --- Liquidity sweep features ---
-    sweep_df = compute_sweep_flags(df, lookback=5)
-    df["sweep_bull"] = sweep_df["sweep_bull"]
-    df["sweep_bear"] = sweep_df["sweep_bear"]
-    df["has_sweep"] = sweep_df["has_sweep"]
-    df["sweep_strength"] = sweep_df["sweep_strength"]
-    # --- FVG features (placeholder for now) ---
-
-    fvg_df = compute_fvg_features(df)
-    df["bull_fvg_origin"] = fvg_df["bull_fvg_origin"]
-    df["bear_fvg_origin"] = fvg_df["bear_fvg_origin"]
-    df["in_bull_fvg"] = fvg_df["in_bull_fvg"]
-    df["in_bear_fvg"] = fvg_df["in_bear_fvg"]
-
-    # Final forward-fill in case of early NaNs from rolling windows
-    df = df.ffill()
-
-    logger.info("BTC feature frame built. Final rows: %s", len(df))
-    return df
-
-
-# ------------------------------------------------------------
-# Backwards-compatible alias for older code (no-arg version)
-# ------------------------------------------------------------
-def build_btc_5m_multiframe_features_institutional(
-    prices: pd.DataFrame | None = None,
-):
-    """
-    Backwards-compatible alias so older code that calls
-        build_btc_5m_multiframe_features_institutional()
-    with NO arguments still works.
-
-    Behavior:
-    - If `prices` is provided: use it directly, return (features_df, n_rows).
-    - If `prices` is None: try to load raw BTC OHLC from a few common paths
-      under the project `data/` folder, then build features.
-
-    Returns
-    -------
-    (features_df, n_rows)
-    """
-    if prices is None:
-        # Try several likely BTC 5m CSV names under ./data
-        candidate_paths = [
-            "data/btc_5m.csv",
-            "data/btc_5m_raw.csv",
-            "data/btc_usdt_5m.csv",
-            "data/btc_5m_prices.csv",
-        ]
-
-        found_path = None
-        for path in candidate_paths:
-            if os.path.exists(path):
-                found_path = path
-                break
-
-        if found_path is None:
-            raise RuntimeError(
-                "Could not find any BTC 5m CSV file. "
-                "Looked for: "
-                + ", ".join(candidate_paths)
-                + ". Please either place your raw BTC OHLC CSV in one of "
-                  "these locations, or pass a DataFrame directly to "
-                  "build_btc_multiframe_features(prices)."
-            )
-
-        try:
-            raw = pd.read_csv(
-                found_path,
-                parse_dates=True,
-                index_col=0,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"Could not load raw BTC data from {found_path}. "
-                f"Make sure the CSV has a datetime-like index column."
-            ) from exc
-
-        prices = raw
-
-    features_df = build_btc_multiframe_features(prices)
-    n_rows = len(features_df)
-    return features_df, n_rows
->>>>>>> origin/phase5-features
