@@ -5,9 +5,9 @@ BTC-specific version of the PO3 "power" strategy.
 
 Goal:
 - Use the institutional BTC feature frame
-- Apply simple but robust filters (ATR%, RVOL, sessions, weekly position, VWAP distance)
+- Apply robust filters (ATR%, RVOL, sessions, weekly position, VWAP distance)
+- Optionally require liquidity sweeps + FVG context
 - Generate LONG / SHORT signals in a PO3-flavored way
-- NEVER silently die and return HOLD forever
 """
 
 from __future__ import annotations
@@ -43,12 +43,16 @@ class BTCPO3PowerConfig:
     # Distance from VWAP in ATR units
     max_vwap_dist_atr_entry: float = 1.8
 
-    # Liquidity sweep requirement, if we have a flag such as "has_sweep"
-    require_sweep: bool = False
+    # Liquidity sweep requirement
+    require_sweep: bool = True
+    min_sweep_strength: int = 1  # 1–3 from sweep module
     lookback_sweep_bars: int = 5  # reserved for future use
 
+    # FVG usage: off by default (we'll flip this later to test impact)
+    require_fvg: bool = True  # if True, longs need bull FVG, shorts need bear FVG
+
     # Debug printing
-    verbose: bool = False
+    verbose: bool = True
 
 
 # ============================================================
@@ -58,16 +62,13 @@ class BTCPO3PowerStrategy:
     """
     BTC PO3-style strategy.
 
-    Important notes:
-    - on_bar(row) expects a dict with at least:
+    on_bar(row) expects a dict with at least:
         "open", "high", "low", "close"
-      and optionally:
+    and optionally:
         "atr_pct_5m", "rvol_5m", "session_type",
         "week_pos", "vwap_dist_atr", "regime_trend_up",
-        "has_sweep"
-
-    - If a field is missing, we fall back to SAFE defaults instead of
-      silently blocking trades.
+        "has_sweep", "sweep_strength",
+        "in_bull_fvg", "in_bear_fvg"
     """
 
     def __init__(self, config: BTCPO3PowerConfig) -> None:
@@ -89,7 +90,6 @@ class BTCPO3PowerStrategy:
             return val
         if isinstance(val, (int, float)):
             return bool(val)
-        # strings like "True"/"False"
         if isinstance(val, str):
             v = val.strip().lower()
             if v in ("true", "1", "yes", "y"):
@@ -98,11 +98,17 @@ class BTCPO3PowerStrategy:
                 return False
         return default
 
+    def _get_int(self, row: Dict[str, Any], key: str, default: int) -> int:
+        val = row.get(key, default)
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return default
+
     # -----------------------------
     # Filters
     # -----------------------------
     def _session_ok(self, row: Dict[str, Any]) -> bool:
-        # Expect things like "ASIA", "LONDON", "NY"
         session = str(row.get("session_type", "NY")).upper()
 
         if session.startswith("ASIA"):
@@ -112,23 +118,20 @@ class BTCPO3PowerStrategy:
         if session.startswith("NY"):
             return self.config.allow_ny
 
-        # For any unknown session tag, allow by default
+        # Unknown session → allow by default
         return True
 
     def _vol_ok(self, atr_pct: float) -> bool:
         return (atr_pct >= self.config.min_atr_pct) and (atr_pct <= self.config.max_atr_pct)
 
     def _rvol_ok(self, rvol: float) -> bool:
-        return (rvol >= self.config.min_rvol)
+        return rvol >= self.config.min_rvol
 
     def _trend_ok(self, row: Dict[str, Any]) -> bool:
         if not self.config.use_trend_regime:
             return True
-        # If we don't have a regime flag, treat as "OK"
+        # If we don't have a regime flag, treat as OK
         regime_trend_up = self._get_bool(row, "regime_trend_up", True)
-        # When trend regime is enforced, we always require *some* trend regime flag;
-        # here we just say "OK if it's anything" – the actual direction bias is
-        # handled in the entry logic.
         return bool(regime_trend_up) or (not regime_trend_up)
 
     def _weekly_location_ok_for_long(self, week_pos: float) -> bool:
@@ -143,9 +146,13 @@ class BTCPO3PowerStrategy:
     def _sweep_ok(self, row: Dict[str, Any]) -> bool:
         if not self.config.require_sweep:
             return True
-        # If we require a sweep, look for a generic boolean flag "has_sweep".
+
         has_sweep = self._get_bool(row, "has_sweep", False)
-        return has_sweep
+        if not has_sweep:
+            return False
+
+        strength = self._get_int(row, "sweep_strength", 0)
+        return strength >= self.config.min_sweep_strength
 
     # -----------------------------
     # Core on_bar
@@ -154,13 +161,10 @@ class BTCPO3PowerStrategy:
         """
         Decide whether to go LONG, SHORT, or HOLD on this bar.
 
-        Returned strings:
-            - "LONG"
-            - "SHORT"
-            - "HOLD"
+        Returns:
+            "LONG", "SHORT", or "HOLD"
         """
-
-        # Basic price info (must exist)
+        # Basic price info
         try:
             open_ = float(row["open"])
             close = float(row["close"])
@@ -170,11 +174,15 @@ class BTCPO3PowerStrategy:
             return "HOLD"
 
         # Optional features with safe defaults
-        atr_pct = self._get_float(row, "atr_pct_5m", 0.01)       # 1% ATR as fallback
-        rvol = self._get_float(row, "rvol_5m", 1.0)              # normal volume as fallback
-        week_pos = self._get_float(row, "week_pos", 0.5)         # mid-week as fallback
+        atr_pct = self._get_float(row, "atr_pct_5m", 0.01)       # 1% ATR default
+        rvol = self._get_float(row, "rvol_5m", 1.0)              # normal volume
+        week_pos = self._get_float(row, "week_pos", 0.5)         # mid-week
         vwap_dist_atr = self._get_float(row, "vwap_dist_atr", 0.0)
         regime_trend_up = self._get_bool(row, "regime_trend_up", True)
+
+        # FVG context
+        in_bull_fvg = self._get_bool(row, "in_bull_fvg", False)
+        in_bear_fvg = self._get_bool(row, "in_bear_fvg", False)
 
         # -----------------
         # Global filters
@@ -212,24 +220,24 @@ class BTCPO3PowerStrategy:
         # -----------------
         # PO3-flavored bias
         # -----------------
-        # Very simple PO3-style heuristic for BTC:
-        # - If we're in the lower part of the weekly range and price is closing
-        #   bullish (close > open), favor LONG.
-        # - If we're in the upper part of the weekly range and price is closing
-        #   bearish (close < open), favor SHORT.
-        # - Optional trend regime: if regime_trend_up is True, bias LONGs; if False, bias SHORTs.
+        base_long_bias = (close > open_) and self._weekly_location_ok_for_long(week_pos)
+        base_short_bias = (close < open_) and self._weekly_location_ok_for_short(week_pos)
 
-        long_bias = (close > open_) and self._weekly_location_ok_for_long(week_pos)
-        short_bias = (close < open_) and self._weekly_location_ok_for_short(week_pos)
+        # Optional FVG gating: if enabled, longs must be in bull FVG, shorts in bear FVG
+        if self.config.require_fvg:
+            long_bias = base_long_bias and in_bull_fvg
+            short_bias = base_short_bias and in_bear_fvg
+        else:
+            long_bias = base_long_bias
+            short_bias = base_short_bias
 
+        # Trend regime tilt: when trend is up, favor longs; when down, favor shorts
         if regime_trend_up:
-            # When trend is up, de-prioritize shorts unless really high in weekly range
             if long_bias:
                 return "LONG"
             if short_bias and week_pos > 0.9:
                 return "SHORT"
         else:
-            # When trend is down, de-prioritize longs unless really low in weekly range
             if short_bias:
                 return "SHORT"
             if long_bias and week_pos < 0.1:
@@ -241,5 +249,4 @@ class BTCPO3PowerStrategy:
         if short_bias:
             return "SHORT"
 
-        # Otherwise no clear PO3 bias
         return "HOLD"

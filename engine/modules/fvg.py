@@ -1,64 +1,164 @@
 # engine/modules/fvg.py
+#
+# Fair Value Gap (FVG) detection + feature generator.
+#
+# We implement a classic 3-candle FVG model:
+#
+#   Bullish FVG origin at bar i:
+#       low[i] > high[i-2]
+#       -> gap zone: (high[i-2], low[i])
+#
+#   Bearish FVG origin at bar i:
+#       high[i] < low[i-2]
+#       -> gap zone: (high[i], low[i-2])
+#
+# We then track whether later bars are trading "inside" any active FVG.
+#
+# Output columns:
+#   bull_fvg_origin : bool       # this bar *creates* a bullish FVG
+#   bear_fvg_origin : bool       # this bar *creates* a bearish FVG
+#   in_bull_fvg     : bool       # this bar is trading inside an unfilled bull FVG
+#   in_bear_fvg     : bool       # this bar is trading inside an unfilled bear FVG
+#
+# This is backwards-compatible with older code that imports `detect_fvg`
+# and newer code that calls `compute_fvg_features`.
 
 from __future__ import annotations
 
-from typing import Tuple, List
+import pandas as pd
 
 
-def detect_fvg(
-    highs: List[float],
-    lows: List[float],
-    lookback: int = 3,
-    min_size: float = 2.0,
-) -> Tuple[bool, bool]:
+def detect_fvg(df: pd.DataFrame, lookback: int = 3) -> pd.DataFrame:
     """
-    Detect bullish / bearish Fair Value Gaps (FVG) using a simple 3-candle model.
-
-    We look at the last 3 candles: A, B, C
-      - Bullish FVG:  low(C) > high(A)  AND  (low(C) - high(A)) >= min_size
-      - Bearish FVG:  high(C) < low(A) AND  (low(A) - high(C)) >= min_size
-
-    We also require a small "displacement" by making sure candle B range
-    is not tiny compared to the gap.
+    Detect bullish and bearish 3-candle Fair Value Gaps.
 
     Parameters
     ----------
-    highs, lows : lists of floats
-        High/low series up to current bar.
+    df : pd.DataFrame
+        Must contain ["high", "low", "close"].
     lookback : int
-        Not used heavily here, but kept for future multi-gap logic.
-    min_size : float
-        Minimum size of gap, in price units (ES points).
+        Currently unused but kept for backwards compatibility.
 
     Returns
     -------
-    (bull_fvg, bear_fvg) : tuple of bool
+    pd.DataFrame
+        Columns:
+            bull_fvg_origin
+            bear_fvg_origin
+            in_bull_fvg
+            in_bear_fvg
     """
+    for col in ("high", "low", "close"):
+        if col not in df.columns:
+            raise ValueError(f"detect_fvg: missing '{col}' column in input DataFrame.")
 
-    n = len(highs)
-    if n < 3:
-        return False, False
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
 
-    # last 3 candles
-    h_a, h_b, h_c = highs[-3], highs[-2], highs[-1]
-    l_a, l_b, l_c = lows[-3], lows[-2], lows[-1]
+    index = df.index
 
-    bull_fvg = False
-    bear_fvg = False
+    bull_fvg_origin = pd.Series(False, index=index)
+    bear_fvg_origin = pd.Series(False, index=index)
+    in_bull_fvg = pd.Series(False, index=index)
+    in_bear_fvg = pd.Series(False, index=index)
 
-    # Bullish: C's low is above A's high -> upside imbalance
-    gap_up = l_c - h_a
-    if gap_up >= min_size:
-        # require some displacement: B range not tiny
-        disp = abs(h_b - l_b)
-        if disp >= min_size * 0.5:
-            bull_fvg = True
+    # Active FVG zones we track over time
+    bull_zones = []  # each: {"top": float, "bottom": float}
+    bear_zones = []  # each: {"top": float, "bottom": float}
 
-    # Bearish: C's high is below A's low -> downside imbalance
-    gap_down = l_a - h_c
-    if gap_down >= min_size:
-        disp = abs(h_b - l_b)
-        if disp >= min_size * 0.5:
-            bear_fvg = True
+    # We start from i=2 because we look back 2 bars (i-2)
+    for i in range(2, len(df)):
+        h_i = float(high.iloc[i])
+        l_i = float(low.iloc[i])
+        c_i = float(close.iloc[i])
 
-    return bull_fvg, bear_fvg
+        # --- 1) Check for new FVG origins at bar i ---
+
+        # Bullish FVG: low[i] > high[i-2]
+        h_prev2 = float(high.iloc[i - 2])
+        l_prev2 = float(low.iloc[i - 2])
+
+        if l_i > h_prev2:
+            # Gap from high[i-2] up to low[i]
+            bull_fvg_origin.iloc[i] = True
+            bull_zones.append({"top": h_prev2, "bottom": l_i})
+
+        # Bearish FVG: high[i] < low[i-2]
+        if h_i < l_prev2:
+            # Gap from high[i] up to low[i-2]
+            bear_fvg_origin.iloc[i] = True
+            bear_zones.append({"top": h_i, "bottom": l_prev2})
+
+        # --- 2) Check if current bar is *inside* any existing FVGs ---
+        # We require that the close is inside the zone bounds.
+
+        # Bullish zones
+        still_bull_zones = []
+        for zone in bull_zones:
+            top = zone["top"]
+            bottom = zone["bottom"]
+
+            # If price has completely traded through the zone, consider it filled
+            # (rough heuristic: bar range covers the zone entirely).
+            if (l_i <= top) and (h_i >= bottom):
+                # Zone filled -> do not keep it
+                continue
+
+            # Otherwise, keep it active
+            still_bull_zones.append(zone)
+
+            # Check if close is between zone top and bottom
+            if (c_i >= top) and (c_i <= bottom):
+                in_bull_fvg.iloc[i] = True
+
+        bull_zones = still_bull_zones
+
+        # Bearish zones
+        still_bear_zones = []
+        for zone in bear_zones:
+            top = zone["top"]
+            bottom = zone["bottom"]
+
+            if (l_i <= top) and (h_i >= bottom):
+                # Zone filled
+                continue
+
+            still_bear_zones.append(zone)
+
+            if (c_i >= top) and (c_i <= bottom):
+                in_bear_fvg.iloc[i] = True
+
+        bear_zones = still_bear_zones
+
+    out = pd.DataFrame(index=index)
+    out["bull_fvg_origin"] = bull_fvg_origin
+    out["bear_fvg_origin"] = bear_fvg_origin
+    out["in_bull_fvg"] = in_bull_fvg
+    out["in_bear_fvg"] = in_bear_fvg
+
+    return out
+
+
+def compute_fvg_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    New-style FVG feature generator used by the BTC feature builder.
+
+    For now, this simply calls `detect_fvg` so both old and new code paths
+    share the same output schema.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns:
+            bull_fvg_origin
+            bear_fvg_origin
+            in_bull_fvg
+            in_bear_fvg
+    """
+    return detect_fvg(df)
+

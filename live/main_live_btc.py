@@ -1,4 +1,4 @@
-# live/btc_po3_paper.py
+# live/main_live_btc.py
 #
 # LIVE / PAPER VERSION OF BTC PO3 ENGINE
 # -------------------------------------
@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 # 0. Ensure project root is on sys.path
 # ---------------------------------------------------------------------------
 # When you run:
-#   .venv\Scripts\python.exe live\btc_po3_paper.py
+#   .venv\Scripts\python.exe live\main_live_btc.py
 # Python's sys.path[0] is C:\Python312\quant_engine\live
 # We need C:\Python312\quant_engine on the path so that `import engine...` works.
 
@@ -35,9 +35,14 @@ PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, os.pardir))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+print("DEBUG: PROJECT_ROOT on sys.path ->", PROJECT_ROOT)
+
 # Now imports like `from engine.features...` should work
 from engine.features.btc_multiframe_features import build_btc_multiframe_features
-from engine.strategies.smc_po3_power_btc import BTCPO3PowerStrategy
+from engine.strategies.smc_po3_power_btc import (
+    BTCPO3PowerStrategy,
+    BTCPO3PowerConfig,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +69,8 @@ def fetch_btc_5m_from_twelvedata(
     Returns a DataFrame indexed by timestamp (ascending), with columns:
         ["open", "high", "low", "close", "volume"]
 
-    If anything fails, raises RuntimeError with a helpful message.
+    If volume is missing from the feed, we synthesize a zero-volume column
+    so that the rest of the pipeline still runs.
     """
     url = "https://api.twelvedata.com/time_series"
     params = {
@@ -101,11 +107,19 @@ def fetch_btc_5m_from_twelvedata(
     # Convert to DataFrame
     df = pd.DataFrame(values)
 
-    # Expected keys from TwelveData: datetime, open, high, low, close, volume
-    required_cols = {"datetime", "open", "high", "low", "close", "volume"}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise RuntimeError(f"Missing columns from TwelveData: {missing}")
+    # Expected keys from TwelveData: datetime, open, high, low, close, [volume?]
+    base_required = {"datetime", "open", "high", "low", "close"}
+    missing_base = base_required - set(df.columns)
+    if missing_base:
+        raise RuntimeError(f"Missing core OHLC columns from TwelveData: {missing_base}")
+
+    # If volume is missing, synthesize it as zeros (so pipeline still works)
+    if "volume" not in df.columns:
+        logging.warning(
+            "TwelveData BTC feed has no 'volume' column. "
+            "Synthesizing volume=0.0 for all rows."
+        )
+        df["volume"] = 0.0
 
     # Convert dtypes
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
@@ -171,15 +185,8 @@ def evaluate_latest_bar(
     latest_idx = features.index[-1]
     latest_row = features.iloc[-1]
 
-    # Depending on how your BTCPO3PowerStrategy is implemented,
-    # on_bar may have different signatures.
-    #
-    # The two common patterns we used were:
-    #   on_bar(idx, row)    OR    on_bar(row)
-    #
-    # Right now we assume on_bar(idx, row). If your actual implementation
-    # only takes the row, we will adjust this call once we see a TypeError.
-    decision = strategy.on_bar(latest_idx, latest_row)
+    # Your strategy's on_bar takes a single row: on_bar(self, row)
+    decision = strategy.on_bar(latest_row)
 
     result: Dict[str, Any] = {
         "timestamp": latest_idx,
@@ -227,13 +234,9 @@ def main() -> None:
     if features.empty:
         raise RuntimeError("All feature rows are NaN after dropna – check feature builder.")
 
-    # 5D. Instantiate the BTC PO3 strategy
-    #
-    # IMPORTANT:
-    # Here we assume BTCPO3PowerStrategy() uses the SAME default config
-    # as your backtest (ATR SL=1.2, TP=2.5, max_bars≈96, session filter on, etc.).
-    # If your backtest builds a custom config object, we can mirror that later.
-    strategy = BTCPO3PowerStrategy()
+    # 5D. Instantiate the BTC PO3 strategy with SAME CONFIG STYLE as backtest
+    config = BTCPO3PowerConfig()
+    strategy = BTCPO3PowerStrategy(config=config)
 
     logging.info("BTCPO3PowerStrategy instantiated for live evaluation.")
 

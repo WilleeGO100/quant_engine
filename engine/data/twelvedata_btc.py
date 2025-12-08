@@ -217,7 +217,7 @@ def _demo():
     Run this file directly to sanity-check your TwelveData connectivity.
     """
     print("=== TwelveData BTC/USD 5m demo ===")
-    hist = fetch_btcusd_5m_history(outputsize=20)
+    hist = fetch_make_btc_5m_csv.py(outputsize=20)
     print("\nLast 5 historical candles:")
     print(hist.tail(5))
 
