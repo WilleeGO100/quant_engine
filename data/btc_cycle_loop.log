@@ -1,0 +1,10 @@
+2025-12-12 21:43:04,183 [INFO] BTC 5m cycle loop starting.
+2025-12-12 21:43:04,183 [INFO] Python: C:\Python312\quant_engine\.venv\Scripts\python.exe
+2025-12-12 21:43:04,183 [INFO] Update : C:\Python312\quant_engine\live\update_btc_5m_csv_coinbase.py
+2025-12-12 21:43:04,183 [INFO] Chain  : C:\Python312\quant_engine\live\run_btc_chain_once.py
+2025-12-12 21:43:04,184 [INFO] Sleeping 127.8s until next 5m boundary + 12s (UTC target=2025-12-13 03:45:12+00:00)
+2025-12-12 21:47:32,384 [INFO] BTC 5m cycle loop starting.
+2025-12-12 21:47:32,384 [INFO] Python: C:\Python312\quant_engine\.venv\Scripts\python.exe
+2025-12-12 21:47:32,384 [INFO] Update : C:\Python312\quant_engine\live\update_btc_5m_csv_coinbase.py
+2025-12-12 21:47:32,386 [INFO] Chain  : C:\Python312\quant_engine\live\run_btc_chain_once.py
+2025-12-12 21:47:32,386 [INFO] Sleeping 159.6s until next 5m boundary + 12s (UTC target=2025-12-13 03:50:12+00:00)

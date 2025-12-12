@@ -26,13 +26,11 @@ from dotenv import load_dotenv
 # Load .env if present
 load_dotenv()
 
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
+TWELVEDATA_API_KEY = os.getenv("080b411961ed44a2ba00c36912fdba3a")
 
-if not TWELVEDATA_API_KEY:
-    raise RuntimeError(
-        "TWELVEDATA_API_KEY not set. "
-        "Add it to a .env file or your environment."
-    )
+TWELVEDATA_API_KEY="080b411961ed44a2ba00c36912fdba3a"
+
+
 
 BASE_URL = "https://api.twelvedata.com/time_series"
 
@@ -41,7 +39,7 @@ SYMBOL = "BTC/USD"
 INTERVAL = "5min"
 TIMEZONE = "UTC"
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger()
 if not logger.handlers:
     handler = logging.StreamHandler()
     formatter = logging.Formatter(
