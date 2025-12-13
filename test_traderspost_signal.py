@@ -1,40 +1,39 @@
 # test_traderspost_signal.py
 #
-# Minimal sanity check that TradersPostExecutor builds the right JSON
-# and (in live mode) can reach your webhook.
+# Minimal test to verify TradersPostExecutor builds the correct JSON
+# and (optionally) reaches your webhook.
 
 from engine.execution.traderspost_executor import TradersPostExecutor
 
 
 def main() -> None:
-    # >>>> IMPORTANT <<<<
-    # Paste YOUR webhook URL string between the quotes below.
-    # Example: "https://webhooks.traderspost.io/trading/webhook/6d52.../ef54..."
+    # >>> IMPORTANT <<<
+    # Paste YOUR webhook URL here.
     webhook_url = "https://webhooks.traderspost.io/trading/webhook/6d521a51-75c0-49fc-acda-427f9af5e6e2/ef543ebe65285b354d3844419465db9a"
 
     config = {
         "traderspost_webhook_url": webhook_url,
-        "traderspost_ticker": "MNQ",   # matches your curl example
-        "entry_order_type": "market",
-
-        # START WITH DRY RUN = False to only print payload.
-        # When you're absolutely sure, set this to True to hit the webhook.
-        "live_trading": True,
+        "trade_symbol": "MNQ",        # symbol TP expects
+        "live_trading": False,        # START FALSE (dry run)
     }
 
-    executor = TradersPostExecutor(config=config)
+    executor = TradersPostExecutor(config)
 
-    # This mimics the decision dict coming from your strategy
-    decision = {
-        "signal": "LONG",    # -> action "buy"
-        "size": 1.0,         # quantity
-        # optional extras:
-        # "signal_price": 17450.25,
-        # "take_profit_pct": 10.0,
-        # "stop_loss_pct": 5.0,
+    # Define the trade you want to send
+    signal = "LONG"          # or "SHORT"
+    size = 1.0               # quantity
+    test_flag = True         # TradersPost test mode
+    meta = {
+        "source": "test_traderspost_signal.py",
+        "note": "sanity test"
     }
 
-    executor.send_order(decision, current_state=None)
+    executor.send_order(
+        signal=signal,
+        size=size,
+        test=test_flag,
+        meta=meta
+    )
 
 
 if __name__ == "__main__":

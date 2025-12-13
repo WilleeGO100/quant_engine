@@ -1,19 +1,18 @@
-"""
-engine/strategies/smc_po3_power_btc.py
-
-BTC-specific version of the PO3 "power" strategy.
-
-Goal:
-- Use the institutional BTC feature frame
-- Apply simple but robust filters (ATR%, RVOL, sessions, weekly position, VWAP distance)
-- Generate LONG / SHORT signals in a PO3-flavored way
-- NEVER silently die and return HOLD forever
-"""
+# engine/strategies/smc_po3_power_btc.py
+#
+# BTC-specific PO3 "power" strategy using:
+#   - ATR% volatility filter
+#   - RVOL filter
+#   - Session filter
+#   - Weekly position
+#   - VWAP distance (PREFERRED: % distance)
+#   - Trend regime (EMA-based)
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict
+import math
 
 
 # ============================================================
@@ -26,7 +25,8 @@ class BTCPO3PowerConfig:
     max_atr_pct: float = 0.06
 
     # Relative volume filter
-    min_rvol: float = 0.6
+    min_rvol: float = 0.25
+    max_rvol: float | None = None  # optional upper cap if you ever want it
 
     # Session filters
     allow_asia: bool = False
@@ -40,14 +40,16 @@ class BTCPO3PowerConfig:
     min_week_pos_for_longs: float = 0.10
     max_week_pos_for_shorts: float = 0.90
 
-    # Distance from VWAP in ATR units
+    # VWAP filters
+    # Preferred: percent distance from VWAP (stable for tuning)
+    max_vwap_abs_pct: float = 0.15  # 3% default
+    # Optional: ATR-units distance from VWAP (can explode on long histories; keep as secondary)
     max_vwap_dist_atr_entry: float = 1.8
 
-    # Liquidity sweep requirement, if we have a flag such as "has_sweep"
+    # Liquidity sweep requirement (we keep the knob but default to OFF)
     require_sweep: bool = False
-    lookback_sweep_bars: int = 5  # reserved for future use
+    lookback_sweep_bars: int = 5
 
-    # Debug printing
     verbose: bool = False
 
 
@@ -58,16 +60,12 @@ class BTCPO3PowerStrategy:
     """
     BTC PO3-style strategy.
 
-    Important notes:
-    - on_bar(row) expects a dict with at least:
+    on_bar(row) expects at least:
         "open", "high", "low", "close"
-      and optionally:
+    and ideally:
         "atr_pct_5m", "rvol_5m", "session_type",
-        "week_pos", "vwap_dist_atr", "regime_trend_up",
-        "has_sweep"
-
-    - If a field is missing, we fall back to SAFE defaults instead of
-      silently blocking trades.
+        "week_pos", "vwap_dist_abs_pct", "vwap_dist_atr",
+        "regime_trend_up", "has_sweep"
     """
 
     def __init__(self, config: BTCPO3PowerConfig) -> None:
@@ -89,7 +87,6 @@ class BTCPO3PowerStrategy:
             return val
         if isinstance(val, (int, float)):
             return bool(val)
-        # strings like "True"/"False"
         if isinstance(val, str):
             v = val.strip().lower()
             if v in ("true", "1", "yes", "y"):
@@ -102,7 +99,7 @@ class BTCPO3PowerStrategy:
     # Filters
     # -----------------------------
     def _session_ok(self, row: Dict[str, Any]) -> bool:
-        # Expect things like "ASIA", "LONDON", "NY"
+        # Expect "ASIA", "LONDON", "NY"
         session = str(row.get("session_type", "NY")).upper()
 
         if session.startswith("ASIA"):
@@ -112,134 +109,148 @@ class BTCPO3PowerStrategy:
         if session.startswith("NY"):
             return self.config.allow_ny
 
-        # For any unknown session tag, allow by default
+        # Unknown session tag → allow
         return True
 
     def _vol_ok(self, atr_pct: float) -> bool:
+        if not math.isfinite(atr_pct):
+            return False
         return (atr_pct >= self.config.min_atr_pct) and (atr_pct <= self.config.max_atr_pct)
 
     def _rvol_ok(self, rvol: float) -> bool:
-        return (rvol >= self.config.min_rvol)
+        if not math.isfinite(rvol):
+            return False
+        if rvol < self.config.min_rvol:
+            return False
+        if self.config.max_rvol is not None and rvol > self.config.max_rvol:
+            return False
+        return True
 
     def _trend_ok(self, row: Dict[str, Any]) -> bool:
         if not self.config.use_trend_regime:
             return True
-        # If we don't have a regime flag, treat as "OK"
-        regime_trend_up = self._get_bool(row, "regime_trend_up", True)
-        # When trend regime is enforced, we always require *some* trend regime flag;
-        # here we just say "OK if it's anything" – the actual direction bias is
-        # handled in the entry logic.
-        return bool(regime_trend_up) or (not regime_trend_up)
-
-    def _weekly_location_ok_for_long(self, week_pos: float) -> bool:
-        return week_pos >= self.config.min_week_pos_for_longs
-
-    def _weekly_location_ok_for_short(self, week_pos: float) -> bool:
-        return week_pos <= self.config.max_week_pos_for_shorts
-
-    def _vwap_ok(self, vwap_dist_atr: float) -> bool:
-        return abs(vwap_dist_atr) <= self.config.max_vwap_dist_atr_entry
+        # presence is enough; strategy uses the value later
+        _ = self._get_bool(row, "regime_trend_up", True)
+        return True
 
     def _sweep_ok(self, row: Dict[str, Any]) -> bool:
         if not self.config.require_sweep:
             return True
-        # If we require a sweep, look for a generic boolean flag "has_sweep".
         has_sweep = self._get_bool(row, "has_sweep", False)
         return has_sweep
 
+    def _vwap_ok_atr(self, vwap_dist_atr: float) -> bool:
+        # Secondary/legacy VWAP filter in ATR units
+        if not math.isfinite(vwap_dist_atr):
+            return True  # don't kill trades if missing
+        return abs(vwap_dist_atr) <= self.config.max_vwap_dist_atr_entry
+
+    def _vwap_ok_pct(self, vwap_abs_pct: float) -> bool:
+        # Preferred VWAP filter in percent (absolute distance)
+        if not math.isfinite(vwap_abs_pct):
+            return True
+        # max_vwap_abs_pct is always a float in config; keep guard anyway
+        if self.config.max_vwap_abs_pct is None:
+            return True
+        return vwap_abs_pct <= self.config.max_vwap_abs_pct
+
+    def _weekly_location_ok_for_long(self, week_pos: float) -> bool:
+        if not math.isfinite(week_pos):
+            return True
+        return week_pos >= self.config.min_week_pos_for_longs
+
+    def _weekly_location_ok_for_short(self, week_pos: float) -> bool:
+        if not math.isfinite(week_pos):
+            return True
+        return week_pos <= self.config.max_week_pos_for_shorts
+
     # -----------------------------
-    # Core on_bar
+    # Core signal logic
     # -----------------------------
     def on_bar(self, row: Dict[str, Any]) -> str:
-        """
-        Decide whether to go LONG, SHORT, or HOLD on this bar.
+        cfg = self.config
 
-        Returned strings:
-            - "LONG"
-            - "SHORT"
-            - "HOLD"
-        """
-
-        # Basic price info (must exist)
+        # Price
         try:
             open_ = float(row["open"])
             close = float(row["close"])
-        except KeyError:
-            if self.config.verbose:
-                print("[BTCPO3] Missing open/close in row; HOLD")
+        except (KeyError, TypeError, ValueError):
+            if cfg.verbose:
+                print("[BTCPO3] HOLD: missing open/close")
             return "HOLD"
 
-        # Optional features with safe defaults
-        atr_pct = self._get_float(row, "atr_pct_5m", 0.01)       # 1% ATR as fallback
-        rvol = self._get_float(row, "rvol_5m", 1.0)              # normal volume as fallback
-        week_pos = self._get_float(row, "week_pos", 0.5)         # mid-week as fallback
-        vwap_dist_atr = self._get_float(row, "vwap_dist_atr", 0.0)
+        atr_pct = self._get_float(row, "atr_pct_5m", 0.0)
+        rvol = self._get_float(row, "rvol_5m", 1.0)
+        week_pos = self._get_float(row, "week_pos", 0.5)
+
+        # VWAP features (preferred: abs pct; secondary: ATR units)
+        vwap_abs_pct = self._get_float(row, "vwap_dist_abs_pct", float("nan"))
+        vwap_dist_atr = self._get_float(row, "vwap_dist_atr", float("nan"))
+
         regime_trend_up = self._get_bool(row, "regime_trend_up", True)
 
         # -----------------
-        # Global filters
+        # Filters (fast → slow)
         # -----------------
+        if not self._session_ok(row):
+            if cfg.verbose:
+                print(f"[BTCPO3] HOLD: session filter failed ({row.get('session_type')})")
+            return "HOLD"
+
         if not self._vol_ok(atr_pct):
-            if self.config.verbose:
-                print(f"[BTCPO3] HOLD: vol filter failed (atr_pct={atr_pct:.5f})")
+            if cfg.verbose:
+                print(f"[BTCPO3] HOLD: ATR%% filter failed ({atr_pct:.6f})")
             return "HOLD"
 
         if not self._rvol_ok(rvol):
-            if self.config.verbose:
-                print(f"[BTCPO3] HOLD: rvol filter failed (rvol={rvol:.2f})")
+            if cfg.verbose:
+                print(f"[BTCPO3] HOLD: RVOL filter failed ({rvol:.3f})")
             return "HOLD"
 
-        if not self._session_ok(row):
-            if self.config.verbose:
-                print(f"[BTCPO3] HOLD: session filter failed (session={row.get('session_type')})")
+        # NEW: VWAP distance filter (percent) — preferred
+        if not self._vwap_ok_pct(vwap_abs_pct):
+            if cfg.verbose:
+                print(f"[BTCPO3] HOLD: vwap abs pct filter failed ({vwap_abs_pct:.4f} > {cfg.max_vwap_abs_pct:.4f})")
             return "HOLD"
 
         if not self._trend_ok(row):
-            if self.config.verbose:
+            if cfg.verbose:
                 print("[BTCPO3] HOLD: trend regime filter failed")
             return "HOLD"
 
         if not self._sweep_ok(row):
-            if self.config.verbose:
+            if cfg.verbose:
                 print("[BTCPO3] HOLD: sweep filter failed")
             return "HOLD"
 
-        if not self._vwap_ok(vwap_dist_atr):
-            if self.config.verbose:
-                print(f"[BTCPO3] HOLD: vwap distance filter failed (dist={vwap_dist_atr:.2f})")
+        # Optional/secondary: VWAP distance (ATR units)
+        # Keep this if you still want it; comment it out if you want VWAP% only.
+        if not self._vwap_ok_atr(vwap_dist_atr):
+            if cfg.verbose:
+                print(f"[BTCPO3] HOLD: vwap ATR distance filter failed ({vwap_dist_atr:.3f})")
             return "HOLD"
 
         # -----------------
         # PO3-flavored bias
         # -----------------
-        # Very simple PO3-style heuristic for BTC:
-        # - If we're in the lower part of the weekly range and price is closing
-        #   bullish (close > open), favor LONG.
-        # - If we're in the upper part of the weekly range and price is closing
-        #   bearish (close < open), favor SHORT.
-        # - Optional trend regime: if regime_trend_up is True, bias LONGs; if False, bias SHORTs.
-
         long_bias = (close > open_) and self._weekly_location_ok_for_long(week_pos)
         short_bias = (close < open_) and self._weekly_location_ok_for_short(week_pos)
 
-        if regime_trend_up:
-            # When trend is up, de-prioritize shorts unless really high in weekly range
+        if cfg.use_trend_regime:
+            if regime_trend_up:
+                if long_bias:
+                    return "LONG"
+                if short_bias and week_pos > 0.9:
+                    return "SHORT"
+            else:
+                if short_bias:
+                    return "SHORT"
+                if long_bias and week_pos < 0.1:
+                    return "LONG"
+        else:
             if long_bias:
                 return "LONG"
-            if short_bias and week_pos > 0.9:
-                return "SHORT"
-        else:
-            # When trend is down, de-prioritize longs unless really low in weekly range
             if short_bias:
                 return "SHORT"
-            if long_bias and week_pos < 0.1:
-                return "LONG"
 
-        # Fallback: if one of the biases is active, take it
-        if long_bias:
-            return "LONG"
-        if short_bias:
-            return "SHORT"
-
-        # Otherwise no clear PO3 bias
         return "HOLD"
