@@ -284,16 +284,22 @@ def _make_reasons_diag(config: BTCPO3PowerConfig,
     min_atr_pct = getattr(config, "min_atr_pct", None)
     max_atr_pct = getattr(config, "max_atr_pct", None)
 
-    # ATR%
+    # ATR%  (EPS-safe boundary)
+    EPS = 1e-12
+
     if atr_pct is None:
         reasons.append("MISSING_ATR_PCT")
     else:
-        if min_atr_pct is not None and atr_pct < float(min_atr_pct):
-            reasons.append(f"ATR_PCT_TOO_LOW({atr_pct:.4f} < {float(min_atr_pct):.4f})")
-        elif max_atr_pct is not None and atr_pct > float(max_atr_pct):
-            reasons.append(f"ATR_PCT_TOO_HIGH({atr_pct:.4f} > {float(max_atr_pct):.4f})")
+        min_atr = float(min_atr_pct) if min_atr_pct is not None else None
+        max_atr = float(max_atr_pct) if max_atr_pct is not None else None
+
+        if min_atr is not None and (atr_pct + EPS) < min_atr:
+            reasons.append(f"ATR_PCT_TOO_LOW({atr_pct:.4f} < {min_atr:.4f})")
+        elif max_atr is not None and (atr_pct - EPS) > max_atr:
+            reasons.append(f"ATR_PCT_TOO_HIGH({atr_pct:.4f} > {max_atr:.4f})")
         else:
             reasons.append(f"ATR_PCT({atr_pct:.4f})")
+
 
     # RVOL
     if rvol is None:
